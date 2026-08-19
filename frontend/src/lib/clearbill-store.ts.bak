@@ -1,0 +1,851 @@
+import { useSyncExternalStore } from "react";
+import { toast } from "sonner";
+
+import { claimIdempotencyKey } from "./idempotency";
+import { simulateApiCall, simulateApiRead, snapshotState } from "./network";
+import { addGymMemberSchema, firstIssue } from "./validation";
+
+import type { CalendarDate } from "./calendar-date";
+import {
+  addCalendarDays,
+  calendarToday,
+  parseCalendarDate,
+  toCalendarDate,
+  toUtcTimestamp,
+} from "./calendar-date";
+
+
+/* ------------------------------------------------------------------ *
+ * RELATIONAL SCHEMA (Supabase / PostgreSQL handoff shape)
+ * ------------------------------------------------------------------ */
+
+export type Package = {
+  id: string;
+  name: string;
+  price: number;
+  duration_days: number;
+  is_archived: boolean;
+  /** legacy aliases kept for view-layer compatibility */
+  fee: number;
+  days: number;
+};
+
+/** Alias retained for existing imports. */
+export type GymPackage = Package;
+
+/** Reconciliation state machine — no booleans allowed. */
+export type TransactionStatus = "staged" | "processing" | "settled" | "rejected";
+
+export type PaymentMethod = "safepay" | "kuickpay" | "raast" | "cash";
+
+export type SubscriptionLedger = {
+  id: string;
+  user_id: string;
+  package_id: string;
+  package_name: string;
+  invoiced_amount: number;
+  liquidated_amount: number;
+  billing_period_start: CalendarDate; // strict "YYYY-MM-DD", UTC-anchored
+  billing_period_end: CalendarDate; // strict "YYYY-MM-DD", UTC-anchored
+  status: TransactionStatus;
+  /** Immutable after staging — the gateway de-duplication hash. */
+  readonly idempotency_key: string;
+  /** Optimistic concurrency token; incremented on every mutation. */
+  version_lock: number;
+  payment_method: PaymentMethod;
+};
+
+/** Alias retained for existing imports. */
+export type Subscription_Ledger = SubscriptionLedger;
+
+/** Base member record: no denormalised status / days_remaining / LTV. */
+export type Member = {
+  id: string;
+  node_id: string;
+  full_name: string;
+  phone_number: string;
+  package_id: string;
+  activation_date: CalendarDate; // strict "YYYY-MM-DD", UTC-anchored
+  suspension_days_accrued: number;
+  lifecycle_status: "active" | "inactive";
+  subscription_history: SubscriptionLedger[];
+};
+
+/** Alias retained for existing imports. */
+export type GymUser = Member;
+
+/** Automation engine lexicon. */
+export type TaskQueueConfig = {
+  enabled: boolean;
+  cadence_type: "once" | "smart" | "aggressive" | "custom";
+  /** days relative to expiry, e.g. [-3, 0, 3] */
+  execution_triggers: number[];
+  custom_triggers: number[];
+  dispatch_suspension_window: { start: string; end: string; enabled: boolean };
+  template_id: string;
+};
+
+export type Task_Queue_Config = TaskQueueConfig;
+
+export type IntegrationsConfig = {
+  whatsapp: {
+    encrypted_whatsapp_token: string;
+    phone_number_id: string;
+    template_id: string;
+    silent_autobilling_enabled: boolean;
+    enable_ai_messaging: boolean;
+    ai_tone: "polite_urdu" | "firm_urdu" | "formal_english" | "custom";
+  };
+  safepay: {
+    environment: "sandbox" | "production";
+    public_key: string;
+    encrypted_safepay_secret: string;
+    encrypted_safepay_webhook_secret: string;
+    is_active: boolean;
+  };
+  kuickpay: {
+    institution_id: string;
+    encrypted_kuickpay_secret: string;
+    is_active: boolean;
+  };
+  raast: {
+    merchant_id: string;
+    is_active: boolean;
+  };
+};
+
+export type MemberStatus = "PAID" | "UNPAID" | "INACTIVE";
+
+/** Derived read-model consumed by the UI. Never persisted. */
+export type GymMember = {
+  id: string;
+  name: string;
+  phone: string;
+  packageId: string;
+  packageName: string;
+  fee: number;
+  expiry: string; // computed calendar date "YYYY-MM-DD"
+  status: MemberStatus; // computed
+  lifetimeValue: number; // computed
+  suspensionDays: number;
+};
+
+export type Student = {
+  id: string;
+  name: string;
+  parentPhone: string;
+  grade: string;
+  rollNo: string;
+  fee: number;
+  status: "PAID" | "UNPAID";
+};
+
+export type ActivityEvent = {
+  id: string;
+  memberId?: string;
+  at: string; // ISO
+  kind: "payment" | "whatsapp" | "system" | "status" | "member_added" | "member_deactivated";
+  message: string;
+};
+
+export type DashboardMetrics = {
+  totalCollected: number;
+  totalUnpaidValue: number;
+  unpaidCount: number;
+  paidCount: number;
+  activeCount: number;
+  unpaidRatio: number;
+};
+
+type State = {
+  current_node_id: string;
+  gymPackages: Package[];
+  gymUsers: Member[];
+  taskQueueConfig: TaskQueueConfig;
+  integrations: IntegrationsConfig;
+  daily_collections_chart: number[];
+  students: Student[];
+  activity: ActivityEvent[];
+  /**
+   * Server-computed aggregates. Never derived in the browser: once the member
+   * list is paginated a client-side Σ is mathematically wrong. Populated only
+   * by `store.fetchGlobalTelemetry()` (one SQL aggregate on the backend).
+   */
+  telemetry_kpis: GymTelemetryKpis;
+};
+
+export type GymTelemetryKpis = {
+  mrr: number;
+  collected: number;
+  outstanding: number;
+  active_members: number;
+  expiring_soon: number;
+  churn_rate: number;
+  synced_at: string | null;
+  is_syncing: boolean;
+  /** True until the first server aggregate lands — UI skeletons instead of "0". */
+  isLoadingTelemetry: boolean;
+};
+
+export const EMPTY_GYM_TELEMETRY: GymTelemetryKpis = {
+  mrr: 0,
+  collected: 0,
+  outstanding: 0,
+  active_members: 0,
+  expiring_soon: 0,
+  churn_rate: 0,
+  synced_at: null,
+  is_syncing: false,
+  isLoadingTelemetry: true,
+};
+
+/** Derived view exposed to selectors. */
+type StoreView = State & { gymMembers: GymMember[]; activity_logs: ActivityEvent[] };
+
+function addDays(d: Date, days: number) {
+  const r = new Date(d);
+  r.setDate(r.getDate() + days);
+  return r;
+}
+export { addDays };
+
+/** Floored to UTC midnight so SSR and client hydration agree on dates. */
+const now = Math.floor(Date.now() / 86_400_000) * 86_400_000;
+const iso = (offsetMs: number) => new Date(now - offsetMs).toISOString();
+/** Calendar-date (YYYY-MM-DD) helper — deadlines never carry a UTC timestamp. */
+const daysAgo = (d: number) => toCalendarDate(addDays(new Date(now), -d));
+
+/* ------------------------------------------------------------------ *
+ * Computed getters
+ * ------------------------------------------------------------------ */
+
+export function getPackage(s: Pick<State, "gymPackages">, package_id: string) {
+  return s.gymPackages.find((p) => p.id === package_id);
+}
+
+/** expiration = activation_date + duration_days + suspension_days_accrued */
+export function getExpirationDate(user: Member, pkg?: Package): Date {
+  const base = new Date(parseCalendarDate(user.activation_date));
+  const total = (pkg?.duration_days ?? 0) + (user.suspension_days_accrued ?? 0);
+  return addDays(base, total);
+}
+
+export function isExpired(user: Member, pkg?: Package): boolean {
+  return getExpirationDate(user, pkg).getTime() < Date.now();
+}
+
+/** LTV = Σ liquidated_amount over settled ledger entries. */
+export function getMemberLTV(user: Member): number {
+  return Math.round(
+    (user.subscription_history ?? [])
+      .filter((l) => l.status === "settled")
+      .reduce((sum, l) => sum + l.liquidated_amount, 0),
+  );
+}
+
+export function getMemberArrears(user: Member): number {
+  return Math.round(
+    (user.subscription_history ?? []).reduce(
+      (sum, l) => sum + ((l.invoiced_amount ?? 0) - (l.liquidated_amount ?? 0)),
+      0,
+    ),
+  );
+}
+
+export const getLifetimeValue = getMemberLTV;
+
+/** Current cycle entry = most recent ledger row. */
+export function getCurrentCycleEntry(user: Member): SubscriptionLedger | undefined {
+  return [...(user.subscription_history ?? [])].sort(
+    (a, b) =>
+      new Date(b.billing_period_start).getTime() - new Date(a.billing_period_start).getTime(),
+  )[0];
+}
+
+export function getMemberStatus(user: Member, pkg?: Package): MemberStatus {
+  if (user.lifecycle_status === "inactive" || isExpired(user, pkg)) return "INACTIVE";
+  return getCurrentCycleEntry(user)?.status === "settled" ? "PAID" : "UNPAID";
+}
+
+function toMember(user: Member, s: State): GymMember {
+  const pkg = getPackage(s, user.package_id);
+  return {
+    id: user.id,
+    name: user.full_name,
+    phone: user.phone_number,
+    packageId: user.package_id,
+    packageName: pkg?.name ?? "—",
+    fee: pkg?.price ?? 0,
+    expiry: toCalendarDate(getExpirationDate(user, pkg)),
+    status: getMemberStatus(user, pkg),
+    lifetimeValue: getMemberLTV(user),
+    suspensionDays: user.suspension_days_accrued ?? 0,
+  };
+}
+
+export function getDashboardMetrics(s: State = state): DashboardMetrics {
+  const rows = s.gymUsers.map((u) => toMember(u, s));
+  const totalCollected = s.gymUsers.reduce((sum, u) => sum + getMemberLTV(u), 0);
+  const unpaid = rows.filter((m) => m.status === "UNPAID");
+  const paid = rows.filter((m) => m.status === "PAID");
+  const active = rows.filter((m) => m.status !== "INACTIVE");
+  return {
+    totalCollected: Math.round(totalCollected),
+    totalUnpaidValue: Math.round(unpaid.reduce((sum, m) => sum + m.fee, 0)),
+    unpaidCount: unpaid.length,
+    paidCount: paid.length,
+    activeCount: active.length,
+    unpaidRatio: active.length > 0 ? unpaid.length / active.length : 0,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Mock dataset
+ * ------------------------------------------------------------------ */
+
+const uuid = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `id-${Math.random().toString(36).slice(2)}`;
+
+const NODE_ID = "node_johar_town_01";
+
+function pkg(id: string, name: string, price: number, duration_days: number): Package {
+  return { id, name, price, duration_days, is_archived: false, fee: price, days: duration_days };
+}
+
+function cycles(
+  user_id: string,
+  package_id: string,
+  package_name: string,
+  amount: number,
+  duration_days: number,
+  activationOffsetDays: number,
+  settledCount: number,
+  trailing?: TransactionStatus,
+): SubscriptionLedger[] {
+  const rows: SubscriptionLedger[] = [];
+  const methods: PaymentMethod[] = ["safepay", "kuickpay", "raast"];
+  for (let i = 0; i < settledCount; i++) {
+    const startOffset = activationOffsetDays + (settledCount - 1 - i) * duration_days;
+    const start = daysAgo(startOffset);
+    rows.push({
+      id: uuid(),
+      user_id,
+      package_id,
+      package_name,
+      invoiced_amount: amount,
+      liquidated_amount: amount,
+      billing_period_start: start,
+      billing_period_end: addCalendarDays(start, duration_days),
+      status: "settled",
+      idempotency_key: uuid(),
+      version_lock: 1,
+      payment_method: methods[i % methods.length]!,
+    });
+  }
+  if (trailing) {
+    const start = daysAgo(activationOffsetDays - duration_days);
+    rows.push({
+      id: uuid(),
+      user_id,
+      package_id,
+      package_name,
+      invoiced_amount: amount,
+      liquidated_amount: amount,
+      billing_period_start: start,
+      billing_period_end: addCalendarDays(start, duration_days),
+      status: trailing,
+      idempotency_key: uuid(),
+      version_lock: 1,
+      payment_method: "kuickpay",
+    });
+  }
+  return rows;
+}
+
+function member(
+  id: string,
+  full_name: string,
+  phone_number: string,
+  package_id: string,
+  package_name: string,
+  amount: number,
+  duration_days: number,
+  activationOffsetDays: number,
+  settledCount: number,
+  trailing?: TransactionStatus,
+): Member {
+  return {
+    id,
+    node_id: NODE_ID,
+    full_name,
+    phone_number,
+    package_id,
+    activation_date: daysAgo(activationOffsetDays),
+    suspension_days_accrued: 0,
+    lifecycle_status: "active",
+    subscription_history: cycles(
+      id,
+      package_id,
+      package_name,
+      amount,
+      duration_days,
+      activationOffsetDays,
+      settledCount,
+      trailing,
+    ),
+  };
+}
+
+const initial: State = {
+  current_node_id: NODE_ID,
+  gymPackages: [
+    pkg("p1", "Standard Monthly", 5000, 30),
+    pkg("p2", "Quarterly Saver", 15000, 90),
+    pkg("p3", "Half-Year Elite", 28000, 180),
+    pkg("p4", "Trial Week", 1500, 7),
+  ],
+  gymUsers: [
+    member("m1", "Ahmed Raza", "+923214261066", "p2", "Quarterly Saver", 15000, 90, 58, 3, "staged"),
+    member("m2", "Bilal Hussain", "+923001122334", "p1", "Standard Monthly", 5000, 30, 18, 12),
+    member("m3", "Hamza Sheikh", "+923334455667", "p3", "Half-Year Elite", 28000, 180, 60, 3),
+    member("m4", "Zainab Malik", "+923457788990", "p1", "Standard Monthly", 5000, 30, 25, 3, "staged"),
+    member("m5", "Usman Tariq", "+923025566778", "p2", "Quarterly Saver", 15000, 90, 28, 2),
+  ],
+  taskQueueConfig: {
+    enabled: true,
+    cadence_type: "smart",
+    execution_triggers: [-3, 0, 3],
+    custom_triggers: [-3, 0, 3],
+    dispatch_suspension_window: { start: "21:00", end: "08:00", enabled: true },
+    template_id: "fee_reminder_urdu_v3",
+  },
+  integrations: {
+    whatsapp: {
+      encrypted_whatsapp_token: "",
+      phone_number_id: "",
+      template_id: "fee_reminder_urdu_v3",
+      silent_autobilling_enabled: true,
+      enable_ai_messaging: false,
+      ai_tone: "polite_urdu",
+    },
+    safepay: {
+      environment: "sandbox",
+      public_key: "",
+      encrypted_safepay_secret: "",
+      encrypted_safepay_webhook_secret: "",
+      is_active: false,
+    },
+    kuickpay: { institution_id: "", encrypted_kuickpay_secret: "", is_active: false },
+    raast: { merchant_id: "", is_active: false },
+  },
+  daily_collections_chart: [
+    12000, 8000, 15500, 9000, 21000, 5000, 18000, 24000, 11000, 16500, 7000, 19500, 26000, 13500,
+  ],
+  students: [
+    { id: "s1", name: "Ali Khan", parentPhone: "+92 321 8877665", grade: "Class 8 - Section A", rollNo: "8A-14", fee: 12000, status: "UNPAID" },
+    { id: "s2", name: "Fatima Noor", parentPhone: "+92 333 6655443", grade: "Class 5 - Section B", rollNo: "5B-07", fee: 9500, status: "PAID" },
+    { id: "s3", name: "Hassan Iqbal", parentPhone: "+92 300 1239876", grade: "Class 10 - Section A", rollNo: "10A-22", fee: 15000, status: "PAID" },
+    { id: "s4", name: "Ayesha Siddiqui", parentPhone: "+92 345 9988776", grade: "Class 3 - Section C", rollNo: "3C-11", fee: 8000, status: "UNPAID" },
+    { id: "s5", name: "Bilal Ahmad", parentPhone: "+92 302 4433221", grade: "Class 7 - Section A", rollNo: "7A-05", fee: 11000, status: "PAID" },
+    { id: "s6", name: "Sara Rehman", parentPhone: "+92 321 7766554", grade: "Class 9 - Section B", rollNo: "9B-18", fee: 13500, status: "PAID" },
+  ],
+  telemetry_kpis: EMPTY_GYM_TELEMETRY,
+  activity: [
+    { id: "a1", memberId: "m2", at: iso(1000 * 60 * 42), kind: "payment", message: "Bilal Hussain paid Rs. 5,000 via Safepay" },
+    { id: "a2", memberId: "m3", at: iso(1000 * 60 * 60 * 3), kind: "whatsapp", message: "System sent automated WhatsApp reminder to Hamza Sheikh" },
+    { id: "a3", memberId: "m5", at: iso(1000 * 60 * 60 * 22), kind: "payment", message: "Usman Tariq paid Rs. 15,000 via KuickPay" },
+    { id: "a4", at: iso(1000 * 60 * 60 * 40), kind: "system", message: "Silent Auto-Billing evaluated 4 members for expiry" },
+    { id: "a5", memberId: "m1", at: iso(1000 * 60 * 60 * 70), kind: "whatsapp", message: "System sent automated WhatsApp to Ahmed Raza" },
+  ],
+};
+
+let state: State = initial;
+const listeners = new Set<() => void>();
+
+let viewCache: StoreView | null = null;
+function view(s: State): StoreView {
+  if (viewCache && viewCache.gymUsers === s.gymUsers && viewCache.gymPackages === s.gymPackages) {
+    if (
+      viewCache.activity === s.activity &&
+      viewCache.students === s.students &&
+      viewCache.integrations === s.integrations &&
+      viewCache.telemetry_kpis === s.telemetry_kpis &&
+      viewCache.taskQueueConfig === s.taskQueueConfig
+    )
+      return viewCache;
+    viewCache = { ...s, gymMembers: viewCache.gymMembers, activity_logs: s.activity };
+    return viewCache;
+  }
+  viewCache = { ...s, gymMembers: s.gymUsers.map((u) => toMember(u, s)), activity_logs: s.activity };
+  return viewCache;
+}
+
+function emit() {
+  listeners.forEach((l) => l());
+}
+
+function pushActivity(ev: Omit<ActivityEvent, "id" | "at">) {
+  state = {
+    ...state,
+    activity: [
+      { ...ev, id: uuid(), at: toUtcTimestamp() },
+      ...state.activity,
+    ].slice(0, 40),
+  };
+}
+
+export const store = {
+  get: () => view(state),
+  /** Multi-tenant safety: wipes every gym ledger back to an empty tenant. */
+  reset: () => {
+    state = {
+      ...initial,
+      gymPackages: [],
+      gymUsers: [],
+      students: [],
+      activity: [],
+      daily_collections_chart: [],
+    };
+    viewCache = null;
+    emit();
+  },
+  raw: () => state,
+  subscribe: (l: () => void) => {
+    listeners.add(l);
+    return () => listeners.delete(l);
+  },
+  metrics: () => getDashboardMetrics(state),
+  addGymPackage: (p: { name: string; fee: number; days: number }) => {
+    state = {
+      ...state,
+      gymPackages: [...state.gymPackages, pkg(uuid(), p.name, p.fee, p.days)],
+    };
+    emit();
+  },
+  /** Soft delete — historical ledger math stays intact. */
+  archiveGymPackage: (id: string) => {
+    state = {
+      ...state,
+      gymPackages: state.gymPackages.map((p) => (p.id === id ? { ...p, is_archived: true } : p)),
+    };
+    emit();
+  },
+  restoreGymPackage: (id: string) => {
+    state = {
+      ...state,
+      gymPackages: state.gymPackages.map((p) => (p.id === id ? { ...p, is_archived: false } : p)),
+    };
+    emit();
+  },
+  addGymMember: (m: {
+    name: string;
+    phone: string;
+    packageId: string;
+    packageName: string;
+    fee: number;
+    expiry: string;
+  }) => {
+    const parsed = addGymMemberSchema.safeParse({
+      name: m.name,
+      phone: m.phone,
+      packageId: m.packageId,
+      fee: m.fee,
+      expiry: m.expiry,
+    });
+    if (!parsed.success) {
+      toast.error(firstIssue(parsed.error));
+      return { ok: false as const, error: firstIssue(parsed.error) };
+    }
+    const id = uuid();
+    const p = getPackage(state, m.packageId);
+    const duration = p?.duration_days ?? 30;
+    const activation = toCalendarDate(addDays(new Date(parseCalendarDate(m.expiry)), -duration));
+    const user: Member = {
+      id,
+      node_id: state.current_node_id,
+      full_name: m.name,
+      phone_number: m.phone,
+      package_id: m.packageId,
+      activation_date: activation,
+      suspension_days_accrued: 0,
+      lifecycle_status: "active",
+      subscription_history: [
+        {
+          id: uuid(),
+          user_id: id,
+          package_id: m.packageId,
+          package_name: p?.name ?? m.packageName,
+          invoiced_amount: Math.round(p?.price ?? m.fee),
+          liquidated_amount: Math.round(p?.price ?? m.fee),
+          billing_period_start: activation,
+          billing_period_end: toCalendarDate(m.expiry),
+          status: "staged",
+          idempotency_key: uuid(),
+          version_lock: 1,
+          payment_method: "cash",
+        },
+      ],
+    };
+    state = { ...state, gymUsers: [...state.gymUsers, user] };
+    pushActivity({
+      memberId: id,
+      kind: "member_added",
+      message: `New member enrolled: ${m.name} on ${m.packageName}`,
+    });
+    emit();
+    return { ok: true as const, id };
+  },
+
+  /* ---------------- Server-side aggregation seam ---------------- */
+
+  /** Stand-in for a single backend SQL aggregate over the whole tenant. */
+  fetchGlobalTelemetry: async (): Promise<GymTelemetryKpis> => {
+    state = { ...state, telemetry_kpis: { ...state.telemetry_kpis, is_syncing: true } };
+    emit();
+    await simulateApiRead(220);
+    state = { ...state, telemetry_kpis: { ...aggregateGymRows(state), synced_at: toUtcTimestamp(), is_syncing: false, isLoadingTelemetry: false } };
+    emit();
+    return state.telemetry_kpis;
+  },
+
+  /**
+   * Anti-harassment / anti-double-charge pre-flight: has an async gateway
+   * webhook already settled this member's current cycle?
+   */
+  verifyMemberFreshness: async (member_id: string): Promise<boolean> => {
+    await simulateApiRead(160);
+    const u = state.gymUsers.find((x) => x.id === member_id);
+    if (!u) return false;
+    const current = getCurrentCycleEntry(u);
+    if (!current) return true;
+    return current.status !== "settled" || current.liquidated_amount < current.invoiced_amount;
+  },
+  /**
+   * Settle a member's cycle. Pre-flight freshness ping → optimistic write →
+   * simulated round-trip → rollback to snapshot on network desync.
+   */
+  markMemberPaid: async (
+    id: string,
+    method: PaymentMethod = "cash",
+    action_idempotency_key?: string,
+  ): Promise<boolean> => {
+    const u = state.gymUsers.find((x) => x.id === id);
+    if (!u) return false;
+    // Double-spend lock: a replayed click must never mint a phantom cycle.
+    if (action_idempotency_key && !claimIdempotencyKey(action_idempotency_key)) return false;
+
+    const fresh = await store.verifyMemberFreshness(id);
+    if (!fresh) {
+      await store.fetchGlobalTelemetry(); // auto-refresh the stale row
+      toast.error("CYCLE ALREADY SETTLED", {
+        description: "A gateway webhook cleared this member. Row refreshed.",
+      });
+      return false;
+    }
+    const snapshot = snapshotState(state); // deep-cloned rollback anchor
+    const p = getPackage(state, u.package_id);
+    const amount = p?.price ?? 0;
+    const current = getCurrentCycleEntry(u);
+    const start = calendarToday();
+    const history =
+      current && current.status !== "settled"
+        ? u.subscription_history.map((l) =>
+            l.id === current.id
+              ? {
+                  ...l,
+                  status: "settled" as TransactionStatus,
+                  liquidated_amount: Math.round(amount),
+                  payment_method: method,
+                  version_lock: l.version_lock + 1,
+                }
+              : l,
+          )
+        : [
+            ...u.subscription_history,
+            {
+              id: uuid(),
+              user_id: u.id,
+              package_id: u.package_id,
+              package_name: p?.name ?? "—",
+              invoiced_amount: Math.round(amount),
+              liquidated_amount: Math.round(amount),
+              billing_period_start: start,
+              billing_period_end: addCalendarDays(start, p?.duration_days ?? 30),
+              status: "settled" as TransactionStatus,
+              idempotency_key: uuid(),
+              version_lock: 1,
+              payment_method: method,
+            },
+          ];
+    state = {
+      ...state,
+      gymUsers: state.gymUsers.map((x) => (x.id === id ? { ...x, subscription_history: history } : x)),
+    };
+    pushActivity({
+      memberId: id,
+      kind: "payment",
+      message: `${u.full_name} marked paid (${method === "cash" ? "Cash" : method}) — Rs. ${amount.toLocaleString("en-PK")}`,
+    });
+    emit(); // optimistic paint
+
+    try {
+      await simulateApiCall();
+      return true;
+    } catch {
+      state = snapshot; // zero ghost data
+      emit();
+      toast.error("NETWORK DESYNC: Settlement Failed", {
+        description: "The payment was rolled back. Nothing was committed.",
+      });
+      return false;
+    }
+  },
+  deactivateMember: (id: string) => {
+    const u = state.gymUsers.find((x) => x.id === id);
+    if (!u) return;
+    state = {
+      ...state,
+      gymUsers: state.gymUsers.map((x) =>
+        x.id === id ? { ...x, lifecycle_status: "inactive" as const } : x,
+      ),
+    };
+    pushActivity({
+      memberId: id,
+      kind: "member_deactivated",
+      message: `${u.full_name}'s package expired. Moved to inactive.`,
+    });
+    emit();
+  },
+  reactivateMember: (id: string) => {
+    state = {
+      ...state,
+      gymUsers: state.gymUsers.map((x) =>
+        x.id === id ? { ...x, lifecycle_status: "active" as const } : x,
+      ),
+    };
+    emit();
+  },
+  /** Membership freeze / pause — pushes the computed expiry forward. */
+  accrueSuspension: (id: string, days: number) => {
+    const u = state.gymUsers.find((x) => x.id === id);
+    if (!u) return;
+    state = {
+      ...state,
+      gymUsers: state.gymUsers.map((x) =>
+        x.id === id
+          ? { ...x, suspension_days_accrued: (x.suspension_days_accrued ?? 0) + days }
+          : x,
+      ),
+    };
+    pushActivity({
+      memberId: id,
+      kind: "status",
+      message: `${u.full_name}'s membership paused for ${days} days`,
+    });
+    emit();
+  },
+  updateTaskQueueConfig: (patch: Partial<TaskQueueConfig>) => {
+    state = { ...state, taskQueueConfig: { ...state.taskQueueConfig, ...patch } };
+    emit();
+  },
+  updateIntegrations: <K extends keyof IntegrationsConfig>(
+    key: K,
+    patch: Partial<IntegrationsConfig[K]>,
+  ) => {
+    state = {
+      ...state,
+      integrations: {
+        ...state.integrations,
+        [key]: { ...state.integrations[key], ...patch },
+      },
+    };
+    emit();
+  },
+  triggerReminder: (id: string) => {
+    const u = state.gymUsers.find((x) => x.id === id);
+    if (!u) return;
+    pushActivity({
+      memberId: id,
+      kind: "whatsapp",
+      message: `Auto-reminder queued to Meta API for ${u.full_name}`,
+    });
+    emit();
+  },
+  /** Queues a WhatsApp payload for every unpaid member on the active node. */
+  dispatchBulkReminders: (): number => {
+    const targets = state.gymUsers.filter((u) => {
+      const p = getPackage(state, u.package_id);
+      return getMemberStatus(u, p) === "UNPAID";
+    });
+    targets.forEach((u) =>
+      pushActivity({
+        memberId: u.id,
+        kind: "whatsapp",
+        message: `Bulk reminder queued to Meta API for ${u.full_name}`,
+      }),
+    );
+    if (targets.length > 0) {
+      pushActivity({
+        kind: "system",
+        message: `Bulk dispatch executed — ${targets.length} reminder payloads staged`,
+      });
+    }
+    emit();
+    return targets.length;
+  },
+  addStudent: (s: Omit<Student, "id" | "status">) => {
+    state = { ...state, students: [...state.students, { ...s, id: uuid(), status: "UNPAID" }] };
+    emit();
+  },
+};
+
+export function useStore<T>(selector: (s: StoreView) => T): T {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => selector(view(state)),
+    () => selector(view(initial)),
+  );
+}
+
+
+/**
+ * Stands in for the SQL aggregate behind `store.fetchGlobalTelemetry()`.
+ * Lives outside the store so no component can accidentally call it and
+ * re-introduce browser-side global math over a paginated table.
+ */
+function aggregateGymRows(s: State): Omit<GymTelemetryKpis, "synced_at" | "is_syncing" | "isLoadingTelemetry"> {
+  let collected = 0;
+  let invoiced = 0;
+  let mrr = 0;
+  let active = 0;
+  let expiring = 0;
+  let inactive = 0;
+  const soon = addCalendarDays(calendarToday(), 7);
+  for (const u of s.gymUsers) {
+    if (u.lifecycle_status === "inactive") inactive += 1;
+    else active += 1;
+    const p = getPackage(s, u.package_id);
+    if (p && u.lifecycle_status === "active") {
+      mrr += Math.round((p.price / Math.max(1, p.duration_days)) * 30);
+    }
+    const current = getCurrentCycleEntry(u);
+    if (current && parseCalendarDate(current.billing_period_end) <= parseCalendarDate(soon)) {
+      expiring += 1;
+    }
+    for (const l of u.subscription_history) {
+      invoiced += l.invoiced_amount;
+      collected += l.liquidated_amount;
+    }
+  }
+  const total = active + inactive;
+  return {
+    mrr: Math.round(mrr),
+    collected: Math.round(collected),
+    outstanding: Math.max(0, Math.round(invoiced - collected)),
+    active_members: active,
+    expiring_soon: expiring,
+    churn_rate: total ? Math.round((inactive / total) * 1000) / 10 : 0,
+  };
+}
