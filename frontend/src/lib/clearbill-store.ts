@@ -4,6 +4,7 @@ import { claimIdempotencyKey } from "./idempotency";
 import { addGymMemberSchema, firstIssue } from "./validation";
 import { supabase } from "./supabase";
 import { authStore } from "./auth-store";
+import { dispatchOnboardWelcome, dispatchReminderWhatsApp } from "../services/whatsapp-onboarding";
 import type { CalendarDate } from "./calendar-date";
 import {
   addCalendarDays,
@@ -559,6 +560,22 @@ export const store = {
       toast.error("Ledger creation failed, member was added though.");
     }
     
+    // Fire and forget the automated WhatsApp onboarding
+    dispatchOnboardWelcome({
+      memberName: m.name,
+      phone: m.phone,
+      institutionName: authUser?.institution_name || "Iron Gym",
+      packageName: p?.name || "Monthly Standard",
+      durationDays: p?.duration_days || 30,
+      feeAmount: p?.price || m.fee || 5000,
+    }).then((res) => {
+      if (res?.success) {
+        toast.success("Welcome WhatsApp dispatched!");
+      } else {
+        toast.warning("Member added, but WhatsApp welcome failed.");
+      }
+    });
+    
     return { ok: true as const, id };
   },
 
@@ -720,6 +737,28 @@ export const store = {
     if (!u) return;
     pushActivity({ memberId: id, kind: "whatsapp", message: `Auto-reminder queued to Meta API for ${u.full_name}` });
     emit();
+
+    const p = getPackage(state, u.package_id);
+    const amount = Math.round(p?.price ?? 0);
+    const current = getCurrentCycleEntry(u);
+    const expiry = current?.billing_period_end ?? "Unknown";
+
+    dispatchReminderWhatsApp({
+      memberName: u.full_name,
+      phone: u.phone_number,
+      institutionName: authStore.getSnapshot().user?.institution_name || "ClearBill Workspace",
+      packageName: p?.name ?? "Membership",
+      durationDays: p?.duration_days ?? 30,
+      startDate: current?.billing_period_start ?? "Unknown",
+      expiryDate: expiry,
+      feeAmount: amount
+    }).then((delivered) => {
+      if (delivered) {
+        toast.success("WhatsApp Reminder Sent!");
+      } else {
+        toast.warning("Failed to send WhatsApp reminder.");
+      }
+    });
   },
 
   dispatchBulkReminders: (): number => {

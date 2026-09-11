@@ -232,13 +232,16 @@ const MembersTable = memo(function MembersTable({ rows, query, onViewProfile }: 
                     <div className="flex justify-center">
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
+                          const cleanPhone = m.phone.replace(/[\s\-\(\)\+]/g, "");
+                          const jid = cleanPhone.startsWith("03") ? "92" + cleanPhone.substring(1) : cleanPhone;
+                          const text = encodeURIComponent(`Hi ${m.name},\nThis is a quick message regarding your Gym membership (${m.packageName}).`);
                           window.open(
-                            `https://wa.me/${m.phone.replace(/\D/g, "")}`,
+                            `https://wa.me/${jid}?text=${text}`,
                             "_blank",
                             "noopener,noreferrer"
-                          )
-                        }
+                          );
+                        }}
                         aria-label={`WhatsApp ${m.name}`}
                         className="flex h-7 w-7 items-center justify-center rounded-md bg-emerald-50 text-emerald-500 opacity-40 group-hover:opacity-100 hover:bg-emerald-100 transition-all duration-300 focus:outline-none focus:ring-0"
                       >

@@ -104,13 +104,47 @@ export const authStore = {
     }
 
     const ws = profile.workspaces;
+    
+    // Fetch the primary node for this workspace if one isn't explicitly assigned
+    let actualNodeId = profile.assigned_node_id;
+    if (!actualNodeId) {
+      const { data: nodes } = await supabase
+        .from("branch_nodes")
+        .select("id")
+        .eq("workspace_id", ws.id)
+        .limit(1);
+      
+      if (nodes && nodes.length > 0) {
+        actualNodeId = nodes[0].id;
+      } else {
+        console.warn("No branch nodes found for workspace", ws.id, "- auto-healing...");
+        // Auto-heal: Create a default branch node if they somehow skipped it during registration
+        const { data: newBranch } = await supabase
+          .from("branch_nodes")
+          .insert({
+            workspace_id: ws.id,
+            name: "Main Campus",
+            code: "MAIN-" + Math.floor(Math.random() * 10000)
+          })
+          .select()
+          .single();
+          
+        if (newBranch) {
+          actualNodeId = newBranch.id;
+        } else {
+          // Absolute fallback so it doesn't crash Postgres with a null UUID
+          actualNodeId = "00000000-0000-0000-0000-000000000000";
+        }
+      }
+    }
+
     return {
       id: userId,
       name: profile.full_name,
       email: email,
       workspace_type: ws.workspace_type as WorkspaceType,
       workspace_id: ws.id,
-      node_id: profile.assigned_node_id || "default_node", 
+      node_id: actualNodeId,
       institution_name: ws.name,
     };
   },

@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { supabase } from "./supabase";
 import { authStore } from "./auth-store";
+import { dispatchOnboardWelcome as dispatchWelcomeWhatsApp } from "../services/whatsapp-onboarding";
 
 import type { CalendarDate } from "./calendar-date";
 import {
@@ -833,6 +834,27 @@ export const schoolStore = {
         parent_phone: seed.parentPhone
       }).then();
     }
+    
+    // Fire and forget the automated WhatsApp onboarding
+    const workspaceName = "Beaconhouse Johar Town Network"; // Default for testing
+    const feeStructure = state.feeStructures.find(f => f.className === s.className);
+    dispatchWelcomeWhatsApp({
+      memberName: seed.name,
+      phone: seed.parentPhone,
+      institutionName: workspaceName,
+      packageName: `Academic Term: ${seed.className} (${seed.section})`,
+      durationDays: 30, // Default for monthly tuition
+      startDate: toUtcTimestamp(),
+      expiryDate: "Monthly Basis", // Schools bill monthly
+      feeAmount: seed.monthlyFee
+    }).then((delivered) => {
+      if (delivered) {
+        toast.success("Student enrolled & Welcome WhatsApp dispatched!");
+      } else {
+        toast.warning("Student enrolled, but WhatsApp welcome failed.");
+      }
+    });
+
     return { ok: true };
   },
   markStudentsPaid: (ids: string[]) => {
